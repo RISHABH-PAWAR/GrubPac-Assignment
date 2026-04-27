@@ -1,0 +1,241 @@
+CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+=================================================
+
+1. AUTHENTICATION & RBAC FLOW
+-------------------------------
+JWT (JSON Web Token) is used for stateless authentication.
+
+On login/register:
+  - bcryptjs (12 salt rounds) hashes the password before storage
+  - A signed JWT is returned with payload: { id, role, email }
+  - JWT is signed with HS256 using a server-side secret (minimum 32 chars enforced at runtime)
+  - Token carries issuer and audience claims for additional verification
+
+On every protected request:
+  1. auth.middleware.js extracts the Bearer token from Authorization header
+  2. jwt.util.verify() validates signature, expiry, issuer, and audience
+  3. The user is fetched from DB to confirm account still exists and is active
+  4. req.user is populated with the verified, live user record
+
+RBAC is enforced by rbac.middleware.js:
+  - requireRole('principal') — only principals may approve/reject content
+  - requireRole('teacher')   — only teachers may upload, submit, and schedule content
+  - requireRole('principal','teacher') — any authenticated user (profile, content by ID)
+
+Role separation is strict. Teachers cannot touch approval endpoints.
+Principals cannot upload files. No privilege escalation is possible since
+roles are always read from the database, not from the token payload alone.
+
+
+2. CONTENT LIFECYCLE & STATUS DESIGN
+--------------------------------------
+The status lifecycle strictly follows the assignment specification:
+
+  uploaded → pending → approved
+                     ↘ rejected (rejection_reason stored and visible to teacher)
+
+Step 1 — UPLOAD:   Teacher POSTs to /content. Status is set to 'uploaded'.
+                   Content is in a draft state; not yet visible to the principal.
+                   Teacher can attach a schedule window at this stage.
+
+Step 2 — SUBMIT:   Teacher POSTs to /content/:id/submit. Status moves to 'pending'.
+                   This is the deliberate trigger that notifies the principal queue.
+                   Separating upload from submission allows teachers to review
+                   their upload before queuing it, avoiding accidental submissions.
+
+Step 3 — APPROVE:  Principal PATCHes /approval/:id/approve. Status becomes 'approved'.
+                   Content is now eligible for broadcasting (subject to schedule window).
+
+Step 3 — REJECT:   Principal PATCHes /approval/:id/reject with rejection_reason.
+                   Status becomes 'rejected'. Teacher sees the reason and must re-upload.
+
+This two-step teacher flow (upload → submit) is intentional and matches the spec's
+lifecycle diagram. 'uploaded' is a real, stored status — not dead code.
+
+Scheduling independence from approval:
+  Teachers may call PATCH /content/:id/schedule on content in any non-rejected state.
+  The schedule window (start_time/end_time) is stored independently from the approval
+  workflow. Content only appears in the live broadcast when BOTH conditions are met:
+    1. status = 'approved'
+    2. current time is within [start_time, end_time)
+  This means a teacher can pre-configure the schedule before the principal approves,
+  and broadcast begins automatically once approval is granted and the window opens.
+  Rejected content cannot be rescheduled — it must be re-uploaded.
+
+
+3. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+Each teacher-subject pair maps to exactly one content_slot row (UNIQUE constraint).
+This slot is the broadcast "channel" for that teacher+subject combination.
+Content is assigned to a slot via content_schedules with rotation_order and duration.
+
+A teacher teaching Maths and Science has two independent slots:
+  - slot (teacher_id, 'maths')
+  - slot (teacher_id, 'science')
+
+These rotate independently. Students can query:
+  GET /api/v1/content/live/:teacher_id           — all live subjects for this teacher
+  GET /api/v1/content/live/:teacher_id/:subject  — specific subject only
+
+
+4. UPLOAD HANDLING APPROACH
+-----------------------------
+File uploads are handled by multer v1 with:
+  - Disk storage under /uploads (configurable via UPLOAD_DIR env var)
+  - Dual allowlist: MIME type AND file extension must both match (jpg/jpeg/png/gif)
+  - File size enforced by multer limits.fileSize (default 10 MB, env-configurable)
+  - Files renamed to {timestamp}-{uuid}.{ext} — collision-proof, prevents path traversal
+  - Files served as static assets under /uploads (1-day cache headers)
+  - file_url stored in DB uses BASE_URL for absolute public access
+
+Orphan protection:
+  If ContentModel.create() throws after multer has saved the file, uploadContent()
+  calls fs.unlink(file.path) to remove the orphaned file from disk. The unlink is
+  fire-and-forget (async, non-blocking) and logs a warning on failure.
+
+S3 upgrade path: Replace DiskStorage with multer-s3. file_url becomes the S3/CloudFront
+URL. No controller or service changes required — the swap is isolated to upload.middleware.js.
+
+
+5. APPROVAL WORKFLOW DESIGN
+-----------------------------
+Lifecycle enforcement is at two levels:
+
+Service layer:
+  - approveContent() checks status === 'pending' before calling ContentModel.approve()
+  - rejectContent() checks status === 'pending' before calling ContentModel.reject()
+  - Both throw 422 if content is in any other state
+
+Database layer (safety net):
+  - approve() UPDATE has WHERE status='pending' — a concurrent approval returns 0 rows
+  - CHECK constraints: approved rows must have approved_by + approved_at
+  - CHECK constraints: rejected rows must have non-empty rejection_reason
+
+Concurrent action safety:
+  If two principals try to approve the same content simultaneously, the DB WHERE clause
+  ensures only one succeeds. The other receives a 409 Conflict from the service layer.
+
+
+6. SCHEDULING / ROTATION LOGIC
+--------------------------------
+Algorithm (stateless, computed on each request — no background workers):
+
+  Reference epoch: midnight UTC of the current calendar day.
+
+  Why midnight UTC (not window-relative)?
+  Using midnight UTC as the epoch produces a deterministic, predictable rotation that:
+    - Is identical across all horizontally-scaled API instances (no shared state needed)
+    - Is easy for teachers to reason about ("Content A is always on in the first 5 minutes
+      of every hour slot I assign it to")
+    - Avoids complexity of per-window state (which would require persisted counters or
+      a background scheduler)
+
+  The trade-off: if a teacher's window starts at 14:00 UTC, the rotation position at
+  that moment is 840 % total_cycle, so Content A is not guaranteed to be item #1 at
+  window open. This is consistent and documented behaviour, not a bug.
+
+  Algorithm steps:
+    1. Fetch all approved content for (teacher_id, subject) where start_time <= NOW < end_time
+    2. Order by rotation_order ASC
+    3. total_cycle = SUM(duration in minutes)
+    4. elapsed = minutesSinceMidnightUTC(NOW)
+    5. position = elapsed % total_cycle
+    6. Walk items accumulating durations — first item whose cumulative range
+       contains `position` is the active item
+
+  Example — 3 Maths items × 5 min (cycle = 15 min):
+    Minutes  0–4  → Content A
+    Minutes  5–9  → Content B
+    Minutes 10–14 → Content C
+    Minute  15    → loops back to A
+
+  Edge cases handled (all return { available: false }):
+    - No approved content for teacher
+    - Approved but outside time window (filtered by DB WHERE clause)
+    - Approved but not scheduled (no content_schedules row)
+    - Invalid or unknown teacher_id
+    - Invalid or unknown subject
+    - Single content item (always returned — 100% of cycle)
+
+
+7. DATABASE DESIGN DECISIONS
+------------------------------
+Tables:
+  users             — principals and teachers with role enum
+  content           — all uploads with full status lifecycle, FK to users
+  content_slots     — one row per (teacher, subject) pair
+  content_schedules — maps content to slot with rotation_order and duration
+
+Key design choices:
+  - UUID PKs (gen_random_uuid()) — collision-proof, distributed-friendly, no enumeration
+  - ENUM types: user_role, content_status, allowed_file_type — enforced at DB layer
+  - CHECK constraints enforce business rules independently of application code
+  - UNIQUE (teacher_id, subject) on content_slots — one channel per teacher+subject
+  - UNIQUE (content_id, slot_id) on content_schedules — no double-scheduling
+  - Partial index on content(status, start_time, end_time) WHERE status='approved'
+    — optimises the hot read path for the public broadcast endpoint
+  - updated_at auto-maintained by PostgreSQL trigger — no ORM overhead
+  - All timestamps are TIMESTAMPTZ — timezone-aware, correct UTC comparisons
+
+
+8. FOLDER STRUCTURE
+--------------------
+src/
+  config/       — database pool (pg), redis client
+  controllers/  — thin HTTP layer: validate input, call service, send response
+  routes/       — route definitions with middleware chain composition
+  services/     — all business logic; independently testable without HTTP
+  middlewares/  — auth, RBAC, upload (multer), rate limiting, error handling
+  models/       — raw SQL query functions; no ORM
+  utils/        — jwt helper, response formatter, winston logger
+  migrations/   — init.sql schema, migrate.js runner, seed.js dev data
+
+tests/
+  setup.js           — environment variables for test isolation
+  scheduling.test.js — unit tests for rotation algorithm (pure functions, no DB)
+  utils.test.js      — unit tests for JWT and response utilities
+  auth.test.js       — integration tests for auth endpoints (mocked DB)
+  broadcast.test.js  — integration tests for RBAC, live API, approval edge cases
+
+
+9. MIDDLEWARE PIPELINE
+-----------------------
+Request pipeline for protected routes:
+  cors → helmet → express.json → authenticate → requireRole → controller
+
+  helmet:          sets 14+ security HTTP headers (HSTS, CSP, X-Frame-Options, etc.)
+  cors:            configurable origin allowlist, credentials support
+  authenticate:    JWT verification + live DB user lookup on every request
+  requireRole:     guards by role enum — composable factory pattern
+  upload (multer): runs only on file upload route; validates before touching disk
+  publicApiLimiter: 100 req/15 min window on /content/live (rate-limits public scraping)
+  authLimiter:     20 req/15 min on login/register (brute-force protection)
+  errorHandler:    maps PG error codes to HTTP status; sanitises 500 messages in production
+
+
+10. SCALABILITY APPROACH
+-------------------------
+Current implementation (assignment scope):
+  - Stateless JWT — horizontally scalable (no server-side sessions)
+  - pg connection pool (max 20) — prevents DB overload under concurrent load
+  - Scheduling is computed on-demand — no background workers or cron jobs
+
+Redis caching (implemented — bonus feature):
+  - /content/live responses cached with 30-second TTL
+  - Cache invalidated on upload, approval, and schedule update
+  - Graceful fallback: API runs fully without Redis
+  - delPattern uses SCAN (not KEYS) for non-blocking, production-safe key enumeration
+
+  NOTE — KEYS vs SCAN: Redis KEYS is O(N) and blocks the event loop during a full
+  keyspace scan. This implementation uses SCAN with COUNT=100 to iterate in batches,
+  yielding control between iterations. KEYS would work for small keyspaces but is
+  unsafe in production Redis instances with millions of keys.
+
+Production scale-out path:
+  - Load balancer (nginx / AWS ALB) in front of multiple Node.js instances
+  - Redis Cluster for distributed caching across instances
+  - S3 + CloudFront for file storage and CDN delivery (multer-s3 drop-in)
+  - PostgreSQL read replicas for heavy broadcast read workloads
+  - Bull.js + Redis for async notification queue (approval email, push notifications)
+  - OpenTelemetry / Sentry for distributed tracing and error monitoring
+  - Rate limiting backed by Redis for distributed enforcement across instances
