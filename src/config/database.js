@@ -1,17 +1,29 @@
 const { Pool } = require('pg');
 const logger = require('../utils/logger.util');
 
-const pool = new Pool({
-  host:     process.env.DB_HOST     || 'localhost',
-  port:     parseInt(process.env.DB_PORT) || 5432,
-  database: process.env.DB_NAME     || 'content_broadcasting',
-  user:     process.env.DB_USER     || 'postgres',
-  password: process.env.DB_PASSWORD || '',
-  max:      parseInt(process.env.DB_POOL_MAX)     || 20,
-  idleTimeoutMillis:    parseInt(process.env.DB_POOL_IDLE)    || 10000,
-  connectionTimeoutMillis: parseInt(process.env.DB_POOL_ACQUIRE) || 30000,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
+// Render (and most PaaS providers) inject a DATABASE_URL connection string.
+// Individual DB_* vars are used for local dev. DATABASE_URL takes priority.
+const poolConfig = process.env.DATABASE_URL
+  ? {
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false }, // required on Render / Heroku / Railway
+      max:                     parseInt(process.env.DB_POOL_MAX)     || 20,
+      idleTimeoutMillis:       parseInt(process.env.DB_POOL_IDLE)    || 10000,
+      connectionTimeoutMillis: parseInt(process.env.DB_POOL_ACQUIRE) || 30000,
+    }
+  : {
+      host:     process.env.DB_HOST     || 'localhost',
+      port:     parseInt(process.env.DB_PORT) || 5432,
+      database: process.env.DB_NAME     || 'content_broadcasting',
+      user:     process.env.DB_USER     || 'postgres',
+      password: process.env.DB_PASSWORD || '',
+      max:                     parseInt(process.env.DB_POOL_MAX)     || 20,
+      idleTimeoutMillis:       parseInt(process.env.DB_POOL_IDLE)    || 10000,
+      connectionTimeoutMillis: parseInt(process.env.DB_POOL_ACQUIRE) || 30000,
+      ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    };
+
+const pool = new Pool(poolConfig);
 
 pool.on('error', (err) => {
   logger.error('Unexpected PostgreSQL pool error', { error: err.message });

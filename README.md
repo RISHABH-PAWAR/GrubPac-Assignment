@@ -230,3 +230,39 @@ Each teacher-subject pair has an independent broadcast rotation.
 - **Redis is optional** — the API operates at full functionality without Redis; caching is silently disabled when `REDIS_HOST` is not set.
 - **Redis `delPattern` uses SCAN** (not `KEYS`) — non-blocking, production-safe for large keyspaces.
 - All timestamps stored and compared in UTC (`TIMESTAMPTZ`).
+
+---
+
+## Deployment — Render
+
+### Option A: render.yaml (recommended)
+
+The repo includes `render.yaml`. In the Render dashboard:
+
+1. New → Blueprint → connect your GitHub repo
+2. Render reads `render.yaml` automatically
+3. Set `JWT_SECRET` manually in the Environment tab (generated value is fine)
+4. Deploy
+
+### Option B: Manual setup
+
+1. New → Web Service → connect repo
+2. **Build Command:** `npm install && npm run migrate`
+3. **Start Command:** `npm start`
+4. Add environment variables:
+
+| Key | Value |
+|-----|-------|
+| `NODE_ENV` | `production` |
+| `DATABASE_URL` | (from your Render PostgreSQL instance — Internal DB URL) |
+| `JWT_SECRET` | any random string, min 32 characters |
+| `BASE_URL` | your Render web service URL, e.g. `https://cbs.onrender.com` |
+| `LOG_LEVEL` | `info` |
+
+### Key points
+
+- **`DATABASE_URL` takes priority** over individual `DB_*` vars — Render injects it automatically when you link a PostgreSQL database.
+- **Do not** put `npm run migrate` inside the Start Command — it belongs in the Build Command. Migrations run once at build time, not on every process restart.
+- The server binds to `0.0.0.0` (not `127.0.0.1`) so Render's proxy can reach it.
+- A DB readiness retry loop (10 attempts × 2s) handles the race condition where the database container starts slower than Node.
+- `UPLOAD_DIR=uploads` stores files on the container's ephemeral disk. For production persistence use S3 (see `architecture-notes.txt`).

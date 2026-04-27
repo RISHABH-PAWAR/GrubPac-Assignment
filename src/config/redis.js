@@ -1,52 +1,58 @@
-const Redis = require('ioredis');
+const Redis  = require('ioredis');
 const logger = require('../utils/logger.util');
 
-let redisClient = null;
+let redisClient    = null;
 let redisAvailable = false;
 
 const initRedis = () => {
-  if (!process.env.REDIS_HOST) {
+  // Support both REDIS_URL (Render/PaaS connection string) and individual vars
+  const redisUrl = process.env.REDIS_URL || process.env.REDIS_HOST;
+  if (!redisUrl) {
     logger.info('Redis not configured — caching disabled');
     return null;
   }
 
-  const client = new Redis({
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT) || 6379,
-    password: process.env.REDIS_PASSWORD || undefined,
-    retryStrategy: (times) => {
-      if (times > 3) {
-        logger.warn('Redis connection failed — running without cache');
-        redisAvailable = false;
-        return null;
+  const config = process.env.REDIS_URL
+    ? {
+        lazyConnect:        true,
+        enableOfflineQueue: false,
+        tls:                process.env.REDIS_URL.startsWith('rediss://') ? {} : undefined,
+        retryStrategy: (times) => {
+          if (times > 3) { redisAvailable = false; return null; }
+          return Math.min(times * 200, 3000);
+        },
       }
-      return Math.min(times * 100, 3000);
-    },
-    enableOfflineQueue: false,
-    lazyConnect: true,
-  });
+    : {
+        host:               process.env.REDIS_HOST || 'localhost',
+        port:               parseInt(process.env.REDIS_PORT) || 6379,
+        password:           process.env.REDIS_PASSWORD || undefined,
+        lazyConnect:        true,
+        enableOfflineQueue: false,
+        retryStrategy: (times) => {
+          if (times > 3) { redisAvailable = false; return null; }
+          return Math.min(times * 200, 3000);
+        },
+      };
 
-  client.on('connect', () => {
-    redisAvailable = true;
-    logger.info('Redis connected successfully');
-  });
+  // ioredis accepts a URL string as first arg when REDIS_URL is set
+  const client = process.env.REDIS_URL
+    ? new Redis(process.env.REDIS_URL, config)
+    : new Redis(config);
 
-  client.on('error', (err) => {
-    redisAvailable = false;
-    logger.warn('Redis error — caching disabled', { error: err.message });
-  });
+  client.on('connect', () => { redisAvailable = true;  logger.info('Redis connected'); });
+  client.on('error',   () => { redisAvailable = false; });
 
   client.connect().catch(() => {
     redisAvailable = false;
-    logger.warn('Redis connection failed on startup — running without cache');
+    logger.warn('Redis connection failed — running without cache');
   });
 
   return client;
 };
 
-const getRedis = () => redisClient;
-const isRedisAvailable = () => redisAvailable;
-
 redisClient = initRedis();
+
+const getRedis         = () => redisClient;
+const isRedisAvailable = () => redisAvailable;
 
 module.exports = { getRedis, isRedisAvailable };
