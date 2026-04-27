@@ -1,0 +1,10 @@
+process.env.NODE_ENV    = 'test';
+process.env.JWT_SECRET  = 'test_jwt_secret_key_32_chars_minimum_!!';
+process.env.DB_HOST     = 'localhost';
+process.env.DB_PORT     = '5432';
+process.env.DB_NAME     = 'content_broadcasting_test';
+process.env.DB_USER     = 'postgres';
+process.env.DB_PASSWORD = 'postgres';
+process.env.UPLOAD_DIR  = '/tmp/cbs_test_uploads';
+process.env.BASE_URL    = 'http://localhost:3000';
+process.env.LOG_LEVEL   = 'silent';
